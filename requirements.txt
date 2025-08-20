@@ -1,0 +1,35 @@
+# ===================================================================
+# requirements.txt for the llm-transparency-tool project
+#
+# This file is intended for use with pip inside a pre-existing Conda
+# environment that already has Python and the CUDA toolkit.
+#
+# To install all packages, run from your activated environment:
+# pip install -r requirements.txt
+# ===================================================================
+
+# -- PyTorch official index for CUDA 12.1 packages --
+# This line ensures that torch, torchvision, and torchaudio are
+# sourced from the correct repository for GPU support.
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# -- Core PyTorch Packages --
+torch
+torchvision
+torchaudio
+
+# -- Other Project Dependencies from the original YAML file --
+datasets
+einops
+fancy_einsum
+jaxtyping==0.2.25
+networkx
+plotly
+pyinstrument
+setuptools
+streamlit
+streamlit_extras
+tokenizers
+transformer_lens
+transformers
+pytest

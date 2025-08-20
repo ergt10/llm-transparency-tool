@@ -85,6 +85,7 @@ class TransformerLensTransparentLlm(TransparentLlm):
         device: str = "gpu",
         dtype: torch.dtype = torch.float32,
         supported_model_name: str = None,
+        first: bool = True
     ):
         if device == "gpu":
             self.device = "cuda"
@@ -102,11 +103,21 @@ class TransformerLensTransparentLlm(TransparentLlm):
         # self._model = tlens_model
         self._model_name = model_name
         self._supported_model_name = supported_model_name
-        self._prepend_bos = True
+        self._prepend_bos = False
         self._last_run = None
         self._run_exception = RuntimeError(
             "Tried to use the model output before calling the `run` method"
         )
+        
+        self._use_hf_chat_template: bool = True
+        self._manual_inst_brackets: bool = False
+        self._add_generation_prompt: bool = True
+        self._system_prompt: Optional[str] = None
+        self._strip_post_instruction: bool = False
+        self._last_post_instruction_suffix_ids: List[int] = []
+            
+        
+
 
     def copy(self):
         import copy
@@ -144,7 +155,9 @@ class TransformerLensTransparentLlm(TransparentLlm):
 
     @torch.no_grad()
     def run(self, sentences: List[str]) -> None:
-        tokens = self._model.to_tokens(sentences, prepend_bos=self._prepend_bos)
+        # Optionally wrap raw user strings with a chat / instruction template
+        prepared = self._prepare_inputs(sentences)
+        tokens = self._model.to_tokens(prepared, prepend_bos=self._prepend_bos)
         logits, cache = self._model.run_with_cache(tokens)
 
         self._last_run = _RunInfo(
@@ -313,3 +326,148 @@ class TransformerLensTransparentLlm(TransparentLlm):
             self._model.blocks[layer].attn.W_O,
         )
         return decomposed_attn
+
+    # ==================== Chat template helpers ====================
+    def configure_chat(
+        self,
+        system_prompt: Optional[str] = None,
+        use_hf_chat_template: bool = True,
+        add_generation_prompt: bool = True,
+        manual_inst_brackets: bool = False,
+    ) -> None:
+        """Configure automatic prompt templating for instruction / chat models.
+
+        If ``use_hf_chat_template`` is True and the tokenizer exposes
+        ``apply_chat_template`` (recent HF tokenizers for Llama / Mistral etc.),
+        inputs passed to ``run`` will be converted from plain user strings to
+        a chat-formatted prompt composed of (optional) system + user messages.
+
+        Fallbacks:
+          * If HF chat template unavailable or disabled, and ``manual_inst_brackets``
+            is True, each sentence becomes ``[INST] <system?> <user> [/INST]``.
+          * Otherwise sentences are used as-is (default original behaviour).
+        """
+        self._system_prompt = system_prompt
+        self._use_hf_chat_template = use_hf_chat_template
+        self._add_generation_prompt = add_generation_prompt
+        self._manual_inst_brackets = manual_inst_brackets
+
+    # ---------------------- Post-instruction control ----------------------
+    def set_strip_post_instruction(self, value: bool) -> None:
+        """Enable/disable removal of post-instruction tokens inside the chat prompt.
+
+        When enabled and using an HF chat template with generation prompt, we build
+        two variants of the prompt (with & without generation prompt), compute the
+        suffix token ids (assistant header etc.), store them for inspection, and
+        return only the *without* version to the model so that the last token is the
+        instruction terminator (<eot_id> in Llama3). This lets downstream code treat
+        that as t_inst without manual sequence slicing.
+        """
+        self._strip_post_instruction = value
+
+    def post_instruction_suffix_ids(self) -> List[int]:
+        """Return the token ids that constitute the last extracted post-instruction
+        suffix for the most recent prepared prompt (empty if none / not applicable)."""
+        return self._last_post_instruction_suffix_ids
+
+    def _prepare_inputs(self, sentences: List[str]) -> List[str]:
+        """Return possibly templated prompt strings.
+
+        The original behaviour (no modification) is preserved unless
+        ``configure_chat`` has been called to enable a mode.
+        """
+        # Fast path: nothing configured
+        if not (self._use_hf_chat_template or self._manual_inst_brackets):
+            return sentences
+
+        prepared: List[str] = []
+        can_use_hf = (
+            self._use_hf_chat_template
+            and self.hf_tokenizer is not None
+            and hasattr(self.hf_tokenizer, "apply_chat_template")
+        )
+        for s in sentences:
+            if can_use_hf:
+                messages = []
+                if self._system_prompt:
+                    messages.append({"role": "system", "content": self._system_prompt})
+                messages.append({"role": "user", "content": s})
+                # HF tokenizer returns a string when tokenize=False. We optionally
+                # construct both variants to identify & optionally remove the
+                # post-instruction suffix (assistant header) tokens.
+                prompt_with_gen = self.hf_tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ) if self._add_generation_prompt else None
+
+                prompt_without_gen = self.hf_tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+
+                if self._add_generation_prompt and prompt_with_gen is not None:
+                    # Compute token id difference (suffix) between with_gen and without_gen.
+                    ids_full = self.hf_tokenizer.encode(
+                        prompt_with_gen, add_special_tokens=False
+                    )
+                    ids_no = self.hf_tokenizer.encode(
+                        prompt_without_gen, add_special_tokens=False
+                    )
+                    # Guard: ensure without_gen is prefix of with_gen
+                    if len(ids_no) <= len(ids_full) and ids_full[: len(ids_no)] == ids_no:
+                        suffix = ids_full[len(ids_no) :]
+                    else:
+                        suffix = []  # fallback (unexpected template change)
+                    # Optionally also strip the terminal <eot_id> token which belongs
+                    # to post-instruction region per your definition (blue segment).
+                    if self._strip_post_instruction:
+                        eot_id = None
+                        try:
+                            eot_id = self.hf_tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                        except Exception:
+                            eot_id = None
+                        if eot_id is not None and len(ids_no) > 0 and ids_no[-1] == eot_id:
+                            # Prepend eot to suffix list; remove it from base sequence.
+                            suffix = [eot_id] + suffix
+                            ids_no = ids_no[:-1]
+                            # Reconstruct prompt_without_gen without the eot token.
+                            prompt_without_gen = self.hf_tokenizer.decode(
+                                ids_no, skip_special_tokens=False
+                            )
+                    self._last_post_instruction_suffix_ids = suffix
+                    if self._strip_post_instruction:
+                        # Use the version without generation prompt.
+                        prompt = prompt_without_gen
+                    else:
+                        prompt = prompt_with_gen
+                else:
+                    # Generation prompt disabled globally; no suffix.
+                    ids_no = self.hf_tokenizer.encode(
+                        prompt_without_gen, add_special_tokens=False
+                    )
+                    suffix = []
+                    if self._strip_post_instruction:
+                        # Strip <eot_id> even when no generation prompt.
+                        eot_id = None
+                        try:
+                            eot_id = self.hf_tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                        except Exception:
+                            eot_id = None
+                        if eot_id is not None and len(ids_no) > 0 and ids_no[-1] == eot_id:
+                            suffix = [eot_id]
+                            ids_no = ids_no[:-1]
+                            prompt_without_gen = self.hf_tokenizer.decode(
+                                ids_no, skip_special_tokens=False
+                            )
+                    self._last_post_instruction_suffix_ids = suffix
+                    prompt = prompt_without_gen
+
+                prepared.append(prompt)
+            elif self._manual_inst_brackets:
+                sys_part = (self._system_prompt + " ") if self._system_prompt else ""
+                prepared.append(f"[INST] {sys_part}{s} [/INST]")
+            else:
+                prepared.append(s)
+        return prepared

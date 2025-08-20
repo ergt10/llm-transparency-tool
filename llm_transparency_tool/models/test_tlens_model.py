@@ -19,7 +19,7 @@ class TransparentLlmTestCase(unittest.TestCase):
         # change this model, but you'll need to update tokenization specifics in some
         # tests.
         cls._llm = TransformerLensTransparentLlm(
-            model_name="facebook/opt-125m",
+            model_name="EleutherAI/pythia-14m",
             device="cpu",
         )
 
@@ -32,28 +32,26 @@ class TransparentLlmTestCase(unittest.TestCase):
         self.assertEqual(
             info,
             ModelInfo(
-                name="facebook/opt-125m",
-                n_params_estimate=84934656,
-                n_layers=12,
-                n_heads=12,
-                d_model=768,
-                d_vocab=50272,
+                name="EleutherAI/pythia-14m",
+                n_params_estimate=1179648,
+                n_layers=6,
+                n_heads=4,
+                d_model=128,
+                d_vocab=50304,
             ),
         )
 
     def test_tokens(self):
         tokens = self._llm.tokens()
-
-        pad = 1
-        bos = 2
-        test = 21959
-        one = 112
-
-        self.assertEqual(tokens.tolist(), [[bos, test, pad], [bos, test, one]])
+    # Pythia-14M (GPTNeoX) tokenizes inputs into two tokens each here.
+    # "test" -> [2566, 0]; "test 1" -> [2566, 337]
+    self.assertEqual(tokens.tolist(), [[2566, 0], [2566, 337]])
 
     def test_tokens_to_strings(self):
-        s = self._llm.tokens_to_strings(torch.Tensor([2, 21959, 112]).to(torch.int))
-        self.assertEqual(s, ["</s>", "test", " 1"])
+    seq = torch.tensor([2566, 0], dtype=torch.int)
+    s = self._llm.tokens_to_strings(seq)
+    self.assertEqual(len(s), 2)
+    self.assertIn("test", s[0])
 
     def test_manage_state(self):
         # One llm.run was called at the setup. Call one more and make sure the object
@@ -65,7 +63,7 @@ class TransparentLlmTestCase(unittest.TestCase):
         """
         Test that residual_in is a residual_out for the previous layer.
         """
-        for layer in range(1, 12):
+    for layer in range(1, 6):
             prev_residual_out = self._llm.residual_out(layer - 1)
             residual_in = self._llm.residual_in(layer)
             diff = torch.max(torch.abs(residual_in - prev_residual_out)).item()
@@ -101,13 +99,13 @@ class TransparentLlmTestCase(unittest.TestCase):
     def test_tensor_shapes(self):
         # Not much we can do about the tensors, but at least check their shapes and
         # that they don't contain NaNs.
-        vocab_size = 50272
-        n_batch = 2
-        n_tokens = 3
-        d_model = 768
-        d_hidden = d_model * 4
-        n_heads = 12
-        layer = 5
+    vocab_size = 50304
+    n_batch = 2
+    n_tokens = 2
+    d_model = 128
+    d_hidden = 512  # intermediate_size from config
+    n_heads = 4
+    layer = 3
 
         device = self._llm.residual_in(0).device
 

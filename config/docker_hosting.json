@@ -7,7 +7,8 @@
     "models": {
         "facebook/opt-125m": null,
         "gpt2": null,
-        "distilgpt2": null
+        "distilgpt2": null,
+        "meta-llama/Meta-Llama-3-8B-Instruct": null
     },
-    "default_model": "gpt2"
+    "default_model": "meta-llama/Meta-Llama-3-8B-Instruct"
 }
